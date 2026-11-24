@@ -63,6 +63,54 @@ describe("effect-raf-loop-needs-cancel", () => {
     expect(result.diagnostics).toHaveLength(0);
   });
 
+  it.each([
+    { name: "cancels the loop's frame", cancel: "cancelAnimationFrame(frame);", expected: 0 },
+    { name: "only clears the handle", cancel: "", expected: 1 },
+    {
+      name: "cancels an unrelated frame",
+      cancel: "cancelAnimationFrame(unrelatedFrame);",
+      expected: 1,
+    },
+  ])("checks a local cleanup helper that $name", ({ cancel, expected }) => {
+    const result = runRule(
+      effectRafLoopNeedsCancel,
+      `
+      import { useEffect } from "react";
+
+      function useFrames(element: HTMLMediaElement, onFrame: () => void, unrelatedFrame: number) {
+        useEffect(() => {
+          let frame: number | undefined;
+          const tick = () => {
+            onFrame();
+            frame = requestAnimationFrame(tick);
+          };
+          const start = () => {
+            frame ??= requestAnimationFrame(tick);
+          };
+          const stop = () => {
+            if (frame !== undefined) {
+              ${cancel}
+              frame = undefined;
+            }
+          };
+          element.addEventListener("play", start);
+          element.addEventListener("pause", stop);
+          if (!element.paused) {
+            start();
+          }
+          return () => {
+            element.removeEventListener("play", start);
+            element.removeEventListener("pause", stop);
+            stop();
+          };
+        }, [element, onFrame, unrelatedFrame]);
+      }
+      `,
+    );
+    expect(result.parseErrors).toEqual([]);
+    expect(result.diagnostics).toHaveLength(expected);
+  });
+
   it("does not flag a one-shot requestAnimationFrame", () => {
     const result = runRule(
       effectRafLoopNeedsCancel,

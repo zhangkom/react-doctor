@@ -1,6 +1,7 @@
 import { collectReturnedCleanupFunctions } from "../../utils/collect-returned-cleanup-functions.js";
 import { collectBindingAliases } from "../../utils/collect-binding-aliases.js";
 import { defineRule } from "../../utils/define-rule.js";
+import { findEnclosingFunction } from "../../utils/find-enclosing-function.js";
 import { findVariableInitializer } from "../../utils/find-variable-initializer.js";
 import { findTransparentExpressionRoot } from "../../utils/find-transparent-expression-root.js";
 import { getStaticPropertyName } from "../../utils/get-static-property-name.js";
@@ -8,6 +9,7 @@ import { getEffectCallback } from "../../utils/get-effect-callback.js";
 import { isFunctionLike } from "../../utils/is-function-like.js";
 import { isNodeOfType } from "../../utils/is-node-of-type.js";
 import { isProvenEffectHookCall } from "../../utils/is-proven-effect-hook-call.js";
+import { resolveExactLocalFunction } from "../../utils/resolve-exact-local-function.js";
 import { stripParenExpression } from "../../utils/strip-paren-expression.js";
 import { walkAst } from "../../utils/walk-ast.js";
 import { walkSynchronousCallbackFlow } from "../../utils/walk-synchronous-callback-flow.js";
@@ -350,6 +352,7 @@ const cleanupCancelsCollectionValues = (
 
 const cleanupCancelsHandle = (
   cleanupFunction: EsTreeNode,
+  effectCallback: EsTreeNode,
   handleKey: string,
   scopes: ScopeAnalysis,
 ): boolean => {
@@ -361,16 +364,30 @@ const cleanupCancelsHandle = (
     );
   }
   let didCancel = false;
-  walkSynchronousCallbackFlow(cleanupFunction, (child: EsTreeNode) => {
-    if (didCancel) return;
-    if (!isNodeOfType(child, "CallExpression") || !isCancelAnimationFrameCall(child)) {
+  const visitedHelpers = new Set<EsTreeNode>();
+  const isSynchronous = (node: EsTreeNode): boolean =>
+    isFunctionLike(node) && !node.async && !("generator" in node && node.generator);
+  const visit = (child: EsTreeNode): void => {
+    if (didCancel || !isNodeOfType(child, "CallExpression")) return;
+    if (isCancelAnimationFrameCall(child)) {
+      const argument = child.arguments?.[0];
+      if (argument && serializeHandleKey(argument) === handleKey) didCancel = true;
       return;
     }
-    const argument = child.arguments?.[0];
-    if (argument && serializeHandleKey(argument) === handleKey) {
-      didCancel = true;
+    const callee = stripParenExpression(child.callee);
+    if (!isNodeOfType(callee, "Identifier")) return;
+    const helper = resolveExactLocalFunction(callee, scopes);
+    if (
+      helper &&
+      isSynchronous(helper) &&
+      findEnclosingFunction(helper) === effectCallback &&
+      !visitedHelpers.has(helper)
+    ) {
+      visitedHelpers.add(helper);
+      walkSynchronousCallbackFlow(helper, visit, undefined, isSynchronous);
     }
-  });
+  };
+  walkSynchronousCallbackFlow(cleanupFunction, visit, undefined, isSynchronous);
   return didCancel;
 };
 
@@ -939,7 +956,7 @@ export const effectRafLoopNeedsCancel = defineRule({
         if (
           handleKey &&
           cleanupFunctions.some((cleanupFunction) =>
-            cleanupCancelsHandle(cleanupFunction, handleKey, context.scopes),
+            cleanupCancelsHandle(cleanupFunction, callback, handleKey, context.scopes),
           )
         ) {
           continue;
